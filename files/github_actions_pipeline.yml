@@ -1,0 +1,369 @@
+########################################################
+# McAfee Data Pipeline – GitHub Actions CI/CD
+# Triggers: PR → dev, merge to main → stg, tag → prod
+########################################################
+
+name: McAfee Pipeline CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    tags:     ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+
+env:
+  AWS_REGION:          us-east-1
+  TF_VERSION:          1.6.6
+  PYTHON_VERSION:      3.11
+  S3_TF_STATE_BUCKET:  mcafee-terraform-state
+  SLACK_CHANNEL:       "#data-engineering-alerts"
+
+# Prevent concurrent deployments to same environment
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ── 1. CODE QUALITY & TESTS ────────────────────────────
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-cov black isort flake8 boto3 \
+                      pyspark==3.5.0 aws-glue-sessions moto[all]
+
+      - name: Black formatting check
+        run: black --check glue-jobs/ kafka/ emr-scripts/
+
+      - name: isort import ordering check
+        run: isort --check-only glue-jobs/ kafka/ emr-scripts/
+
+      - name: Flake8 linting
+        run: flake8 glue-jobs/ kafka/ emr-scripts/ --max-line-length=120 \
+             --ignore=E501,W503
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v \
+            --cov=glue-jobs \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov/ \
+            --cov-fail-under=80 \
+            -x
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+
+      - name: Validate Kafka schemas
+        run: python scripts/validate_schemas.py --schema-dir kafka/schemas/
+
+  # ── 2. TERRAFORM VALIDATION ────────────────────────────
+  terraform-validate:
+    name: Terraform Validate & Plan
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    strategy:
+      matrix:
+        environment: [dev, stg]
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/mcafee-gh-actions-${{ matrix.environment }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ env.S3_TF_STATE_BUCKET }}" \
+            -backend-config="key=mcafee/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=mcafee-tf-locks"
+
+      - name: Terraform Format Check
+        run: cd terraform && terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: cd terraform && terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var="environment=${{ matrix.environment }}" \
+            -var-file="environments/${{ matrix.environment }}.tfvars" \
+            -out=plan-${{ matrix.environment }}.tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+            const truncated = plan.length > 60000 ? plan.substring(0, 60000) + '\n... (truncated)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan - \`${{ matrix.environment }}\`\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+      - name: tfsec security scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          soft_fail: ${{ matrix.environment == 'dev' }}
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/plan-${{ matrix.environment }}.tfplan
+          retention-days: 5
+
+  # ── 3. DEPLOY TO DEV ──────────────────────────────────
+  deploy-dev:
+    name: Deploy → DEV
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    environment: dev
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/mcafee-gh-actions-dev
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Terraform Apply - DEV
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ env.S3_TF_STATE_BUCKET }}" \
+            -backend-config="key=mcafee/dev/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=mcafee-tf-locks"
+          terraform apply \
+            -var="environment=dev" \
+            -var-file="environments/dev.tfvars" \
+            -auto-approve
+
+      - name: Upload Glue Scripts to S3 (DEV)
+        run: |
+          aws s3 sync glue-jobs/  s3://mcafee-dev-pipeline-scripts/glue-jobs/  \
+            --delete --exclude "*.pyc"
+          aws s3 sync emr-scripts/ s3://mcafee-dev-pipeline-scripts/emr-scripts/ \
+            --delete --exclude "*.pyc"
+
+      - name: Create Kafka Topics (DEV)
+        run: python scripts/kafka_admin.py --env dev --action create-topics
+
+      - name: Run Integration Tests
+        run: |
+          pytest tests/integration/ -v \
+            --env=dev \
+            --aws-region=${{ env.AWS_REGION }}
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "DEV Deploy ${{ job.status }}: ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 4. DEPLOY TO STAGING ──────────────────────────────
+  deploy-stg:
+    name: Deploy → STAGING
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    environment: staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (STG)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_STG_ID }}:role/mcafee-gh-actions-stg
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Terraform Apply - STG
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ env.S3_TF_STATE_BUCKET }}" \
+            -backend-config="key=mcafee/stg/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=mcafee-tf-locks"
+          terraform apply \
+            -var="environment=stg" \
+            -var-file="environments/stg.tfvars" \
+            -auto-approve
+
+      - name: Upload Glue Scripts (STG)
+        run: |
+          aws s3 sync glue-jobs/  s3://mcafee-stg-pipeline-scripts/glue-jobs/  --delete
+          aws s3 sync emr-scripts/ s3://mcafee-stg-pipeline-scripts/emr-scripts/ --delete
+
+      - name: Run Staging E2E Tests
+        run: pytest tests/e2e/ -v --env=stg --timeout=600
+
+      - name: Performance benchmark
+        run: python scripts/performance_benchmark.py --env stg --threshold-seconds 300
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: ${{ env.SLACK_CHANNEL }}
+          text: "STAGING Deploy ${{ job.status }}: ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 5. DEPLOY TO PROD (Tag-triggered + Manual approval) ─
+  deploy-prod:
+    name: Deploy → PRODUCTION
+    runs-on: ubuntu-latest
+    needs: [deploy-stg]
+    environment: production   # Has required reviewers in GitHub
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (PROD)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_PROD_ID }}:role/mcafee-gh-actions-prod
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Create pre-deployment snapshot (Redshift)
+        run: |
+          aws redshift create-cluster-snapshot \
+            --cluster-identifier mcafee-prod-dw \
+            --snapshot-identifier "pre-deploy-${{ github.ref_name }}-$(date +%Y%m%d%H%M%S)"
+
+      - name: Terraform Plan (PROD) - review only
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ env.S3_TF_STATE_BUCKET }}" \
+            -backend-config="key=mcafee/prod/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=mcafee-tf-locks"
+          terraform plan \
+            -var="environment=prod" \
+            -var-file="environments/prod.tfvars" \
+            -out=prod.tfplan
+
+      - name: Terraform Apply - PROD
+        run: |
+          cd terraform
+          terraform apply prod.tfplan
+
+      - name: Upload Glue Scripts (PROD)
+        run: |
+          aws s3 sync glue-jobs/   s3://mcafee-prod-pipeline-scripts/glue-jobs/  --delete
+          aws s3 sync emr-scripts/ s3://mcafee-prod-pipeline-scripts/emr-scripts/ --delete
+
+      - name: Smoke Test PROD
+        run: pytest tests/smoke/ -v --env=prod --timeout=120
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       "McAfee Pipeline ${{ github.ref_name }}"
+          body_path:  CHANGELOG.md
+          draft:      false
+          prerelease: false
+
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status:   ${{ job.status }}
+          channel:  ${{ env.SLACK_CHANNEL }}
+          text:     "🚀 PRODUCTION Deploy ${{ job.status }}: ${{ github.ref_name }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ── 6. ROLLBACK JOB (manual trigger) ─────────────────
+  rollback:
+    name: Rollback Environment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment }}
+    inputs:
+      environment:
+        description: Environment to rollback
+        required: true
+        type: choice
+        options: [dev, stg, prod]
+      tf_state_version:
+        description: Terraform state version to restore
+        required: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Terraform State
+        run: |
+          aws s3api restore-object \
+            --bucket ${{ env.S3_TF_STATE_BUCKET }} \
+            --key mcafee/${{ github.event.inputs.environment }}/terraform.tfstate \
+            --version-id ${{ github.event.inputs.tf_state_version }}
+      - name: Apply previous state
+        run: echo "Rollback initiated for ${{ github.event.inputs.environment }}"
